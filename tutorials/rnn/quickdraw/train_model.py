@@ -173,18 +173,19 @@ def model_fn(features, labels, mode, params):
       cell = tf.nn.rnn_cell.BasicLSTMCell
     elif params.cell_type == "block_lstm":
       cell = tf.contrib.rnn.LSTMBlockCell
-    cells_fw = [cell(params.num_nodes) for _ in range(params.num_layers)]
-    cells_bw = [cell(params.num_nodes) for _ in range(params.num_layers)]
+    elif params.cell_type == "cudnn_compatible_lstm":
+      cell = tf.contrib.cudnn_rnn.CudnnCompatibleLSTMCell
+    cells_fw = [cell(params.num_nodes, forget_bias=0) for _ in range(params.num_layers)]
+    cells_bw = [cell(params.num_nodes, forget_bias=0) for _ in range(params.num_layers)]
     if params.dropout > 0.0:
-      cells_fw = [tf.contrib.rnn.DropoutWrapper(cell) for cell in cells_fw]
-      cells_bw = [tf.contrib.rnn.DropoutWrapper(cell) for cell in cells_bw]
+      cells_fw = [tf.contrib.rnn.DropoutWrapper(cell, output_keep_prob=1.0-params.dropout) for cell in cells_fw]
+      cells_bw = [tf.contrib.rnn.DropoutWrapper(cell, output_keep_prob=1.0-params.dropout) for cell in cells_bw]
     outputs, _, _ = tf.contrib.rnn.stack_bidirectional_dynamic_rnn(
         cells_fw=cells_fw,
         cells_bw=cells_bw,
         inputs=convolved,
         sequence_length=lengths,
-        dtype=tf.float32,
-        scope="rnn_classification")
+        dtype=tf.float32)
     return outputs
 
   def _add_cudnn_rnn_layers(convolved):
@@ -197,16 +198,22 @@ def model_fn(features, labels, mode, params):
         dropout=params.dropout if mode == tf.estimator.ModeKeys.TRAIN else 0.0,
         direction="bidirectional")
     outputs, _ = lstm(convolved)
+    if mode == tf.estimator.ModeKeys.TRAIN and params.dropout > 0:
+      # Adding one last dropout to make it consistent with the normal layers.
+      outputs = tf.layers.dropout(
+            outputs,
+            rate=params.dropout,
+            training=(mode == tf.estimator.ModeKeys.TRAIN))
     # Convert back from time-major outputs to batch-major outputs.
     outputs = tf.transpose(outputs, [1, 0, 2])
     return outputs
 
   def _add_rnn_layers(convolved, lengths):
     """Adds recurrent neural network layers depending on the cell type."""
-    if params.cell_type != "cudnn_lstm":
-      outputs = _add_regular_rnn_layers(convolved, lengths)
-    else:
+    if params.cell_type == "cudnn_lstm":
       outputs = _add_cudnn_rnn_layers(convolved)
+    else:
+      outputs = _add_regular_rnn_layers(convolved, lengths)
     # outputs is [batch_size, L, N] where L is the maximal sequence length and N
     # the number of nodes in the last layer.
     mask = tf.tile(
@@ -220,15 +227,65 @@ def model_fn(features, labels, mode, params):
     """Adds a fully connected layer."""
     return tf.layers.dense(final_state, params.num_classes)
 
+  def get_adversarial_weight():
+    """Computes decayed adversarial weight."""
+    adv_lambda = tf.cast(1.0 - FLAGS.adversarial_weight_start, dtype=tf.float32)
+    adv_lambda = tf.train.exponential_decay(
+        adv_lambda, tf.train.get_global_step(),
+        FLAGS.adversarial_weight_decay_steps,
+        FLAGS.adversarial_weight_decay_rate)
+    adversarial_weight = 1.0 - tf.maximum(adv_lambda, 0.5)
+    tf.summary.scalar("adversarial_weight", adversarial_weight)
+    return adversarial_weight
+
+  def fgsm(inks, lengths, logits, labels, batch_size):
+    loss_tensor = tf.nn.sparse_softmax_cross_entropy_with_logits(
+        labels=labels, logits=logits)
+    grad = tf.gradients(tf.clip_by_value(loss_tensor, 0, 5), inks, name="gradients")
+    grad = tf.squeeze(grad, axis=0)
+    mask = tf.tile(tf.expand_dims(tf.sequence_mask(lengths, tf.shape(grad)[1]), 2),[1, 1, tf.shape(grad)[2]])
+    grad = tf.where(mask, grad, tf.zeros_like(grad))
+
+    # infinity norm
+    grad = tf.check_numerics(grad, "unhappy about input gradient")
+    normalized_grad = tf.sign(grad)
+    return tf.stop_gradient(inks + FLAGS.adversarial_epsilon * normalized_grad)
+
   # Build the model.
   inks, lengths, labels = _get_input_tensors(features, labels)
-  convolved, lengths = _add_conv_layers(inks, lengths)
-  final_state = _add_rnn_layers(convolved, lengths)
-  logits = _add_fc_layers(final_state)
-  # Add the loss.
-  cross_entropy = tf.reduce_mean(
-      tf.nn.sparse_softmax_cross_entropy_with_logits(
-          labels=labels, logits=logits))
+  with tf.variable_scope("rnn_classification", reuse=False) as scope:
+    convolved, lengths = _add_conv_layers(inks, lengths)
+    final_state = _add_rnn_layers(convolved, lengths)
+    logits = _add_fc_layers(final_state)
+    # Add the loss.
+    cross_entropy = tf.reduce_mean(
+        tf.nn.sparse_softmax_cross_entropy_with_logits(
+            labels=labels, logits=logits))
+    cross_entropy = tf.check_numerics(cross_entropy, "unhappy about cross entry")
+    tf.summary.scalar("cross_entry_before_adversarial", cross_entropy)
+
+    # Adversarial training stuff.
+  if FLAGS.adversarial_training:
+    with tf.variable_scope("adversarial_inks"):
+      adversarial_inks = fgsm(inks, lengths, logits, labels, params.batch_size)
+      adversarial_inks = tf.check_numerics(adversarial_inks, "unhappy about adversarial inks")
+    with tf.variable_scope("rnn_classification", reuse=True) as scope:
+      adversarial_convolved, lengths = _add_conv_layers(adversarial_inks, lengths)
+      adversarial_final_state = _add_rnn_layers(adversarial_convolved, lengths)
+      # in http://google3/research/ocr/tensorflow/models/sequence_classifier.py?l=241 the
+      # softmax loss is added separately for adversarial and other samples.
+      adversarial_logits = _add_fc_layers(adversarial_final_state)
+      adversarial_cross_entropy = tf.reduce_mean(
+          tf.nn.sparse_softmax_cross_entropy_with_logits(
+              labels=labels, logits=adversarial_logits))
+      tf.summary.scalar("adversarial_cross_entry", adversarial_cross_entropy)
+
+      adversarial_cross_entropy = tf.check_numerics(adversarial_cross_entropy, "unhappy about adversarial cross entry")
+      adversarial_weight = get_adversarial_weight()
+      # Now mix the adversarial training loss into the standard loss.
+      cross_entropy = ((1 - adversarial_weight) * cross_entropy +
+                       adversarial_weight * adversarial_cross_entropy)
+
   # Add the optimizer.
   train_op = tf.contrib.layers.optimize_loss(
       loss=cross_entropy,
@@ -341,7 +398,7 @@ if __name__ == "__main__":
   parser.add_argument(
       "--learning_rate",
       type=float,
-      default=0.0001,
+      default=0.01,
       help="Learning rate used for training.")
   parser.add_argument(
       "--gradient_clipping_norm",
@@ -368,6 +425,31 @@ if __name__ == "__main__":
       type=str,
       default="",
       help="Path for storing the model checkpoints.")
+  parser.add_argument(
+      "--adversarial_training",
+      type="bool",
+      default="False",
+      help="Whether to use adversarial samples during training or not")
+  parser.add_argument(
+      "--adversarial_epsilon",
+      type=float,
+      default=0.001,
+      help="Epsilon for adversarial training")
+  parser.add_argument(
+      "--adversarial_weight_start",
+      type=float,
+      default=0.0,
+      help="Weight for adversarial training.")
+  parser.add_argument(
+      "--adversarial_weight_decay_rate",
+      type=float,
+      default=0.8,
+      help="Decay rate for adversarial weight decay.")
+  parser.add_argument(
+      "--adversarial_weight_decay_steps",
+      type=int,
+      default=150000,
+      help="Steps for adversarial weight decay.")
   parser.add_argument(
       "--self_test",
       type="bool",
